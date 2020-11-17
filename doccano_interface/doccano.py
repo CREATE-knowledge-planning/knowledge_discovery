@@ -197,7 +197,7 @@ if __name__ == '__main__':
 
     docs = client.fetch_documents(project_id)
     num_processed_docs = 0
-    while num_processed_docs < 100:
+    while num_processed_docs < 200:
         for doc in docs["results"]:
             # Check if doc has already been computed
             doc_meta = json.loads(doc["meta"])
