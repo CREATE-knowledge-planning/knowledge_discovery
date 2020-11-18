@@ -11,6 +11,7 @@ For more details, see the documentation:
 Compatible with: spaCy v2.2.4
 Last tested with: v2.2.4
 """
+import json
 from typing import Tuple
 
 import plac
@@ -22,39 +23,9 @@ import spacy
 from spacy.tokens import Span, Doc
 from spacy.vocab import Vocab
 from spacy.kb import KnowledgeBase
-from spacy.pipeline import EntityRuler
 from spacy.util import minibatch, compounding
 from torch import Tensor
 from transformers import AutoTokenizer, AutoModelForTokenClassification
-
-
-def sample_train_data():
-    train_data = []
-
-    # Q2146908 (Russ Cochran): American golfer
-    # Q7381115 (Russ Cochran): publisher
-
-    text_1 = "Russ Cochran his reprints include EC Comics."
-    dict_1 = {(0, 12): {"Q7381115": 1.0, "Q2146908": 0.0}}
-    train_data.append((text_1, {"links": dict_1}))
-
-    text_2 = "Russ Cochran has been publishing comic art."
-    dict_2 = {(0, 12): {"Q7381115": 1.0, "Q2146908": 0.0}}
-    train_data.append((text_2, {"links": dict_2}))
-
-    text_3 = "Russ Cochran captured his first major title with his son as caddie."
-    dict_3 = {(0, 12): {"Q7381115": 0.0, "Q2146908": 1.0}}
-    train_data.append((text_3, {"links": dict_3}))
-
-    text_4 = "Russ Cochran was a member of University of Kentucky's golf team."
-    dict_4 = {(0, 12): {"Q7381115": 0.0, "Q2146908": 1.0}}
-    train_data.append((text_4, {"links": dict_4}))
-
-    return train_data
-
-
-# training data
-TRAIN_DATA = sample_train_data()
 
 
 class BERTNERComponent(object):
@@ -74,6 +45,8 @@ class BERTNERComponent(object):
         self.label_names = ["INSTRUMENT", "ORBIT", "DESIGN_ID", "INSTRUMENT_PARAMETER", "OBSERVABLE", "MISSION",
                             "OBJECTIVE", "SPACE_AGENCY", "STAKEHOLDER", "SUBOBJECTIVE", "TECHNOLOGY",
                             "NOT_PARTIAL_FULL", "NUMBER", "YEAR", "AGENT", "WAVEBAND", "METHOD"]
+        for label_name in self.label_names:
+            nlp.vocab.strings.add(label_name)
         self.labels = [nlp.vocab.strings[label] for label in self.label_names]  # get entity label ID
         self.label_map = {label_name: label_id for label_name, label_id in zip(self.label_names, self.labels)}
 
@@ -166,6 +139,23 @@ class BERTNERComponent(object):
         return entities
 
 
+def load_training_data():
+    training_file_path = Path("./data/el_training_data.jsonl")
+    training_examples = []
+    with training_file_path.open("r", encoding="utf-8") as training_file:
+        for line in training_file:
+            example_json = json.loads(line)
+            dict_1 = {}
+            if example_json["labels"] != {}:
+                for label in example_json["labels"]:
+                    if label[3] is not None:
+                        dict_1[(label[0], label[1])] = {label[3]: 1.0}
+                    else:
+                        dict_1[(label[0], label[1])] = {}
+                training_examples.append((example_json["sentence"], {"links": dict_1}))
+    return training_examples
+
+
 @plac.annotations(
     kb_path=("Path to the knowledge base", "positional", None, Path),
     vocab_path=("Path to the vocab for the kb", "positional", None, Path),
@@ -175,15 +165,13 @@ class BERTNERComponent(object):
 def main(kb_path, vocab_path, output_dir=None, n_iter=50):
     """Create a blank model with the specified vocab, set up the pipeline and train the entity linker.
     The `vocab` should be the one used during creation of the KB."""
-    # create blank English model with correct vocab
-    nlp = spacy.load("en_core_web_md")
+    nlp = spacy.blank("en")
     nlp.vocab.from_disk(vocab_path)
     nlp.vocab.vectors.name = "spacy_pretrained_vectors"
-    print(f"Loaded 'en' model with vocab from '{vocab_path}'")
+    print("Created blank 'en' model with vocab from '%s'" % vocab_path)
 
     # Add a sentencizer component. Alternatively, add a dependency parser for higher accuracy.
-    nlp.add_pipe(nlp.create_pipe('sentencizer'), first=True)
-    nlp.remove_pipe('ner')
+    nlp.add_pipe(nlp.create_pipe('sentencizer'))
 
     # Add a custom component to recognize "Russ Cochran" as an entity for the example training data.
     # Note that in a realistic application, an actual NER algorithm should be used instead.
@@ -204,48 +192,53 @@ def main(kb_path, vocab_path, output_dir=None, n_iter=50):
 
     # Convert the texts to docs to make sure we have doc.ents set for the training examples.
     # Also ensure that the annotated examples correspond to known identifiers in the knowlege base.
-    # kb_ids = nlp.get_pipe("entity_linker").kb.get_entity_strings()
-    # TRAIN_DOCS = []
-    # for text, annotation in TRAIN_DATA:
-    #     with nlp.disable_pipes("entity_linker"):
-    #         doc = nlp(text)
-    #     annotation_clean = annotation
-    #     for offset, kb_id_dict in annotation["links"].items():
-    #         new_dict = {}
-    #         for kb_id, value in kb_id_dict.items():
-    #             if kb_id in kb_ids:
-    #                 new_dict[kb_id] = value
-    #             else:
-    #                 print(
-    #                     "Removed", kb_id, "from training because it is not in the KB."
-    #                 )
-    #         annotation_clean["links"][offset] = new_dict
-    #     TRAIN_DOCS.append((doc, annotation_clean))
-    #
-    # # get names of other pipes to disable them during training
-    # pipe_exceptions = ["entity_linker", "trf_wordpiecer", "trf_tok2vec"]
-    # other_pipes = [pipe for pipe in nlp.pipe_names if pipe not in pipe_exceptions]
-    # with nlp.disable_pipes(*other_pipes):  # only train entity linker
-    #     # reset and initialize the weights randomly
-    #     optimizer = nlp.begin_training()
-    #     for itn in range(n_iter):
-    #         random.shuffle(TRAIN_DOCS)
-    #         losses = {}
-    #         # batch up the examples using spaCy's minibatch
-    #         batches = minibatch(TRAIN_DOCS, size=compounding(4.0, 32.0, 1.001))
-    #         for batch in batches:
-    #             texts, annotations = zip(*batch)
-    #             nlp.update(
-    #                 texts,  # batch of texts
-    #                 annotations,  # batch of annotations
-    #                 drop=0.2,  # dropout - make it harder to memorise data
-    #                 losses=losses,
-    #                 sgd=optimizer,
-    #             )
-    #         print(itn, "Losses", losses)
+    train_examples = load_training_data()
+    TRAIN_DOCS = []
+    for text, annotation in train_examples:
+        with nlp.disable_pipes("entity_linker"):
+            doc = nlp(text)
+        annotation_clean = annotation
+        dict_1 = {}
+        if doc.ents:
+            for ent in doc.ents:
+                dict_1[(ent.start_char, ent.end_char)] = {}
+                for offsets, kb_element in annotation_clean["links"].items():
+                    start, end = offsets
+                    if ent.start_char == start and ent.end_char == end:
+                        dict_1[offsets] = kb_element
+            annotation_clean["links"] = dict_1
+
+            has_an_elemn = False
+            for offsets, kb_element in annotation_clean["links"].items():
+                if kb_element != {}:
+                    has_an_elemn = True
+            if has_an_elemn:
+                TRAIN_DOCS.append((doc, annotation_clean))
+
+    # get names of other pipes to disable them during training
+    pipe_exceptions = ["entity_linker", "trf_wordpiecer", "trf_tok2vec"]
+    other_pipes = [pipe for pipe in nlp.pipe_names if pipe not in pipe_exceptions]
+    with nlp.disable_pipes(*other_pipes):  # only train entity linker
+        # reset and initialize the weights randomly
+        optimizer = nlp.begin_training()
+        for itn in range(n_iter):
+            random.shuffle(TRAIN_DOCS)
+            losses = {}
+            # batch up the examples using spaCy's minibatch
+            batches = minibatch(TRAIN_DOCS, size=compounding(4.0, 32.0, 1.001))
+            for batch in batches:
+                texts, annotations = zip(*batch)
+                nlp.update(
+                    texts,  # batch of texts
+                    annotations,  # batch of annotations
+                    drop=0.2,  # dropout - make it harder to memorise data
+                    losses=losses,
+                    sgd=optimizer,
+                )
+            print(itn, "Losses", losses)
 
     # test the trained model
-    _apply_model(nlp)
+    _apply_model(nlp, train_examples)
 
     # save model to output directory
     if output_dir is not None:
@@ -262,8 +255,8 @@ def main(kb_path, vocab_path, output_dir=None, n_iter=50):
         _apply_model(nlp2)
 
 
-def _apply_model(nlp):
-    for text, annotation in TRAIN_DATA:
+def _apply_model(nlp, train_data):
+    for text, annotation in train_data:
         # apply the entity linker which will now make predictions for the 'Russ Cochran' entities
         doc = nlp(text)
         print()

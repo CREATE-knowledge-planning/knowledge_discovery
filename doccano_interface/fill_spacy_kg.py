@@ -22,6 +22,7 @@ def get_neo4j_driver():
 
 def retrieve_entities_from_kg(nlp):
     entity_ids = []
+    descr = []
     descr_embeddings = []
     freqs = []
 
@@ -29,8 +30,6 @@ def retrieve_entities_from_kg(nlp):
 
     with driver.session() as session:
         result = session.run('MATCH (n) RETURN n;')
-        entity_dict = {}
-        inv_entity_dict = {}
 
         for record in result:
             node_type = list(record["n"].labels)[0]
@@ -38,10 +37,46 @@ def retrieve_entities_from_kg(nlp):
             node_name = record["n"]["name"]
 
             entity_ids.append(f"{node_type}{node_id}")
+            descr.append(node_name)
             descr_embeddings.append(nlp(node_name).vector)
             freqs.append(1)
 
-    return entity_ids, descr_embeddings, freqs
+        result = session.run(
+            'MATCH (p:Platform)--(s:Sensor) '
+            'WHERE p.status="Currently being flown" RETURN DISTINCT s;')
+        wavebands = set()
+        for record in result:
+            sensor_bands = record["s"]["wavebands"]
+            for band in sensor_bands:
+                wavebands.add(band)
+        waveband_id = 1
+        for band in wavebands:
+            entity_ids.append(f"Waveband{waveband_id}")
+            descr.append(band)
+            descr_embeddings.append(nlp(band).vector)
+            freqs.append(1)
+            waveband_id += 1
+
+        result = session.run(
+            'MATCH (p:Platform)--(s:Sensor) '
+            'WHERE p.status="Currently being flown" RETURN DISTINCT s;')
+        technologies = set()
+        for record in result:
+            sensor_types = record["s"]["types"]
+            sensor_technology = record["s"]["technology"]
+            if sensor_technology is not None:
+                technologies.add(sensor_technology)
+            for sensor_type in sensor_types:
+                technologies.add(sensor_type)
+        tech_id = 1
+        for tech in technologies:
+            entity_ids.append(f"Technology{tech_id}")
+            descr.append(tech)
+            descr_embeddings.append(nlp(tech).vector)
+            freqs.append(1)
+            tech_id += 1
+
+    return entity_ids, descr, descr_embeddings, freqs
 
 
 @plac.annotations(
@@ -69,17 +104,20 @@ def main(model=None, output_dir=None):
     kb = KnowledgeBase(vocab=nlp.vocab, entity_vector_length=vectors_dim)
 
     # set up the data
-    entity_ids, descr_embeddings, freqs = retrieve_entities_from_kg(nlp)
+    entity_ids, descr, descr_embeddings, freqs = retrieve_entities_from_kg(nlp)
 
     # set the entities, can also be done by calling `kb.add_entity` for each entity
     kb.set_entities(entity_list=entity_ids, freq_list=freqs, vector_list=descr_embeddings)
 
     # adding aliases, the entities need to be defined in the KB beforehand
-    # kb.add_alias(
-    #     alias="Russ Cochran",
-    #     entities=["Q2146908", "Q7381115"],
-    #     probabilities=[0.24, 0.7],  # the sum of these probabilities should not exceed 1
-    # )
+    with open("./kg/ent_alias_map.txt", "w") as ent_alias_file:
+        for entity, alias in zip(entity_ids, descr):
+            ent_alias_file.write(f"{entity}\t{alias}\n")
+            kb.add_alias(
+                alias=alias,
+                entities=[entity],
+                probabilities=[1.0],  # the sum of these probabilities should not exceed 1
+            )
 
     # test the trained model
     print()
